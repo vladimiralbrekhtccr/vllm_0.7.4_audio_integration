@@ -12,6 +12,8 @@ from vllm.transformers_utils.configs.exaone import ExaoneConfig
 from vllm.transformers_utils.configs.falcon import RWConfig
 from vllm.transformers_utils.configs.h2ovl import H2OVLChatConfig
 from vllm.transformers_utils.configs.internvl import InternVLChatConfig
+from vllm.transformers_utils.configs.internavl import InternVLChatAudioConfig
+from vllm.transformers_utils.configs.whisper_audio import WhisperConfig
 from vllm.transformers_utils.configs.jais import JAISConfig
 from vllm.transformers_utils.configs.medusa import MedusaConfig
 from vllm.transformers_utils.configs.mllama import MllamaConfig
@@ -33,6 +35,8 @@ __all__ = [
     "RWConfig",
     "H2OVLChatConfig",
     "InternVLChatConfig",
+    "WhisperConfig",
+    "InternVLChatAudioConfig",
     "JAISConfig",
     "MedusaConfig",
     "EAGLEConfig",

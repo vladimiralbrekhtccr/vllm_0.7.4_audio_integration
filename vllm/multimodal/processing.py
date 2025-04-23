@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import re
+import torch
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import (Callable, Generator, ItemsView, Iterable, Mapping,
@@ -1106,7 +1107,18 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         )
         processed_data.update(passthrough_data)
 
-        prompt_ids, = processed_data.pop("input_ids").tolist()
+        # Replace with this code that handles both tensor and list types:
+        input_ids = processed_data.pop("input_ids")
+        if isinstance(input_ids, torch.Tensor):
+            prompt_ids, = input_ids.tolist()
+        elif isinstance(input_ids, list):
+            # It's already a list
+            if len(input_ids) == 1:
+                prompt_ids = input_ids[0]
+            else:
+                prompt_ids = input_ids[0]  # Just take the first one for profiling
+        else:
+            raise TypeError(f"Expected tensor or list for input_ids, got {type(input_ids)}")
 
         mm_kwargs = MultiModalKwargs.from_hf_inputs(
             processed_data,

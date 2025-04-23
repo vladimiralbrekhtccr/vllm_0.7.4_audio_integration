@@ -6,6 +6,7 @@
 # Copyright (c) 2023 OpenGVLab
 # Licensed under The MIT License [see LICENSE for details]
 # --------------------------------------------------------
+# internvl.py from vllm
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping, Sequence
 from functools import cached_property

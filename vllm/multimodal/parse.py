@@ -176,6 +176,86 @@ class AudioProcessorItems(ProcessorBatchItems[HfAudioItem]):
     def __init__(self, data: Sequence[HfAudioItem]) -> None:
         super().__init__(data, "audio")
 
+class InternVLAudioFeatureItems(ModalityDataItems[Mapping[str, list], Mapping[str, torch.Tensor]]):
+    """
+    Handles pre-processed audio data passed as a dictionary containing features and metadata.
+    The input 'data' is expected to be like:
+    {
+        "audio_features": [Tensor[C, T], ...],
+        "audio_len_after_cnn": [Tensor[], ...],
+        "audio_token_num": [Tensor[], ...]
+    }
+    """
+    def __init__(self, data: Mapping[str, list], modality: str) -> None:
+        # Basic validation
+        required_keys = {"audio_features", "audio_len_after_cnn", "audio_token_num"}
+        if not required_keys.issubset(data.keys()):
+            raise ValueError(f"InternVLAudioFeatureItems requires keys {required_keys}")
+
+        # Ensure values are lists of tensors
+        if not (is_list_of(data.get("audio_features"), torch.Tensor) and
+                is_list_of(data.get("audio_len_after_cnn"), torch.Tensor) and
+                is_list_of(data.get("audio_token_num"), torch.Tensor)):
+            raise TypeError("InternVLAudioFeatureItems expects a dictionary with lists of tensors.")
+
+        num_items = len(data["audio_features"])
+        if not (len(data.get("audio_len_after_cnn", [])) == num_items and
+                len(data.get("audio_token_num", [])) == num_items):
+            raise ValueError("All lists in InternVLAudioFeatureItems must have the same length.")
+
+        super().__init__(data, modality)
+        self._num_items = num_items
+        print(f"DEBUG: Initialized InternVLAudioFeatureItems with {self._num_items} items.") # Debug print
+
+    def get_count(self) -> int:
+        return self._num_items
+
+    def get(self, index: int) -> Mapping[str, torch.Tensor]:
+        """Get a single item's data."""
+        if not 0 <= index < self._num_items:
+            raise IndexError("Index out of range")
+        return {
+            "audio_features": self.data["audio_features"][index],
+            "audio_len_after_cnn": self.data["audio_len_after_cnn"][index],
+            "audio_token_num": self.data["audio_token_num"][index],
+        }
+
+    def get_processor_data(self) -> Mapping[str, object]:
+        """No further HF processing needed for this pre-processed data."""
+        print("DEBUG: InternVLAudioFeatureItems.get_processor_data() called (returning empty).") # Debug print
+        return {}
+
+    def get_passthrough_data(self) -> Mapping[str, object]:
+        """Pass the structured data directly to the model kwargs, batched."""
+        print("DEBUG: InternVLAudioFeatureItems.get_passthrough_data() called.") # Debug print
+        # Stack tensors into batches expected by the model's forward pass
+        try:
+            # Ensure features are on the same device before stacking
+            device = self.data["audio_features"][0].device if self._num_items > 0 else 'cpu'
+            feature_list = [t.to(device) for t in self.data["audio_features"]]
+            len_cnn_list = [t.to(device) for t in self.data["audio_len_after_cnn"]]
+            token_num_list = [t.to(device) for t in self.data["audio_token_num"]]
+
+            stacked_features = torch.stack(feature_list, dim=0)
+            # These are likely scalar tensors, stacking adds a dimension [B]
+            stacked_len_cnn = torch.stack(len_cnn_list, dim=0)
+            stacked_token_num = torch.stack(token_num_list, dim=0)
+            print(f"DEBUG: Passthrough shapes: feats={stacked_features.shape}, len={stacked_len_cnn.shape}, num={stacked_token_num.shape}")
+
+        except RuntimeError as e:
+            # This might happen if audio_features tensors have different lengths (C or T dimensions)
+            print(f"ERROR: Could not stack tensors in get_passthrough_data: {e}.")
+            print("       Make sure all audio_features tensors have the same shape.")
+            # You might need padding logic *before* this step if lengths differ.
+            # For now, re-raise to highlight the issue.
+            raise ValueError("Failed to batch pre-processed audio data. Check tensor shapes.") from e
+
+        # These keys MUST match the kwargs expected by InternVLChatAudioModel.forward
+        return {
+            "audio_features": stacked_features,
+            "audio_len_after_cnn": stacked_len_cnn,
+            "audio_token_num": stacked_token_num,
+        }
 
 class AudioEmbeddingItems(EmbeddingItems):
 
@@ -334,42 +414,141 @@ class MultiModalDataParser:
 
         assert_never(audio)
 
+
     def _parse_audio_data(
         self,
         data: ModalityData[AudioItem],
     ) -> ModalityDataItems[Any, Any]:
+        """
+        Parses various audio input formats into specific ModalityDataItems.
+
+        Handles:
+        1. Pre-processed dict: {"audio_features":..., "audio_len_after_cnn":..., "audio_token_num":...}
+        2. Pre-computed embeddings: Tensor (B, Seq, D) or List[Tensor(Seq, D)]
+        3. Raw audio: Single waveform, list of waveforms, or list of (waveform, sr) tuples.
+        """
+        # Case 1: Pre-processed Dictionary (from Dummy Builder or inference script)
+        # Check if it's a dict and has the required keys
+        if isinstance(data, dict) and \
+           {"audio_features", "audio_len_after_cnn", "audio_token_num"}.issubset(data.keys()):
+            print("DEBUG: _parse_audio_data using InternVLAudioFeatureItems (pre-processed dict)")
+
+            # Ensure values are lists of tensors
+            features = data["audio_features"]
+            lens = data["audio_len_after_cnn"]
+            tokens = data["audio_token_num"]
+
+            # --- Standardize to lists of tensors ---
+            # Handle case where input might be single tensor instead of list
+            if not isinstance(features, list):
+                 # If single tensor with >2 dims, assume first is batch dim
+                 if isinstance(features, torch.Tensor) and features.ndim > 2:
+                     features = [f for f in features]
+                 else: # Wrap single item in list
+                     features = [features]
+            if not isinstance(lens, list):
+                 if isinstance(lens, torch.Tensor) and lens.ndim > 0:
+                     lens = [l for l in lens]
+                 else: # Wrap single item in list
+                     lens = [lens]
+            if not isinstance(tokens, list):
+                 if isinstance(tokens, torch.Tensor) and tokens.ndim > 0:
+                     tokens = [t for t in tokens]
+                 else: # Wrap single item in list
+                     tokens = [tokens]
+
+            # --- Ensure elements within lists are Tensors ---
+            try:
+                # Convert non-Tensor elements (like raw numbers if passed incorrectly)
+                features_t = [f if isinstance(f, torch.Tensor) else torch.tensor(f) for f in features]
+                lens_t = [l if isinstance(l, torch.Tensor) else torch.tensor(l, dtype=torch.long) for l in lens]
+                tokens_t = [t if isinstance(t, torch.Tensor) else torch.tensor(t, dtype=torch.long) for t in tokens]
+            except Exception as e:
+                 raise TypeError(f"Failed to convert elements in pre-processed audio dict to tensors: {e}")
+
+            # --- Check for length consistency ---
+            num_items = len(features_t)
+            if not (num_items == len(lens_t) == len(tokens_t)):
+                 raise ValueError(f"List lengths mismatch in pre-processed audio dictionary. "
+                                  f"Got features={len(features_t)}, lens={len(lens_t)}, tokens={len(tokens_t)}")
+
+            processed_data = {
+                "audio_features": features_t,
+                "audio_len_after_cnn": lens_t,
+                "audio_token_num": tokens_t
+            }
+            # Ensure the InternVLAudioFeatureItems class definition is present in parse.py
+            # from your previous code snippet.
+            return InternVLAudioFeatureItems(processed_data, "audio")
+
+        # Case 2: Pre-computed Embeddings
         if self._is_embeddings(data):
+            print("DEBUG: _parse_audio_data using AudioEmbeddingItems (embeddings)")
+            # Ensure AudioEmbeddingItems class is defined in parse.py
             return AudioEmbeddingItems(data)
 
-        if (is_list_of(data, float)
-                or isinstance(data,
-                              (np.ndarray, torch.Tensor)) and data.ndim == 1
-                or isinstance(data, tuple)):
-            data_items = [data]
-        elif isinstance(data, (np.ndarray, torch.Tensor)):
-            data_items = [elem for elem in data]
+        # Case 3: Raw Audio Waveform(s) -> Use AudioProcessorItems
+        print("DEBUG: _parse_audio_data attempting raw audio processing for AudioProcessorItems")
+        raw_audio_items_for_processor: List[HfAudioItem] = [] # Type expected by AudioProcessorItems
+
+        # Subcase 3a: Single raw waveform (np.ndarray, list/tuple of floats, torch.Tensor ndim=1)
+        if isinstance(data, (np.ndarray, torch.Tensor)) and data.ndim == 1:
+            print("DEBUG: Raw audio - single ndarray/tensor waveform")
+            waveform = data.numpy() if isinstance(data, torch.Tensor) else data
+            raw_audio_items_for_processor.append(waveform.astype(np.float32)) # Ensure float32
+        elif isinstance(data, (list, tuple)) and data and isinstance(data[0], (int, float)):
+             print("DEBUG: Raw audio - single list/tuple waveform")
+             raw_audio_items_for_processor.append(np.array(data, dtype=np.float32))
+
+        # Subcase 3b: Batch of raw waveforms (np.ndarray/Tensor ndim > 1) - assume first dim is batch
+        elif isinstance(data, (np.ndarray, torch.Tensor)) and data.ndim > 1:
+             print(f"DEBUG: Raw audio - batch ndarray/tensor waveform (shape {data.shape})")
+             waveforms = data.numpy() if isinstance(data, torch.Tensor) else data
+             raw_audio_items_for_processor.extend([elem.astype(np.float32) for elem in waveforms])
+
+        # Subcase 3c: List containing waveforms or (waveform, sr) tuples
+        elif isinstance(data, list) and data:
+             first_item = data[0]
+             # List of (waveform, sr) tuples - Extract only waveform for AudioProcessorItems
+             if isinstance(first_item, tuple) and len(first_item) == 2:
+                  print("DEBUG: Raw audio - list of (waveform, sr) tuples (extracting waveforms)")
+                  for item in data:
+                      if isinstance(item, tuple) and len(item) == 2:
+                          wf = item[0]
+                          if isinstance(wf, torch.Tensor): wf = wf.numpy()
+                          if isinstance(wf, (list, tuple)): wf = np.array(wf, dtype=np.float32)
+                          if isinstance(wf, np.ndarray):
+                              raw_audio_items_for_processor.append(wf.astype(np.float32))
+                          else:
+                              print(f"Warning: Skipping invalid waveform type in tuple: {type(wf)}")
+                      else:
+                           print(f"Warning: Skipping invalid item in list of tuples: {item}")
+             # List of waveforms (arrays, tensors, lists of floats)
+             elif isinstance(first_item, (np.ndarray, torch.Tensor, list, tuple)):
+                  print("DEBUG: Raw audio - list of waveforms")
+                  for item in data:
+                      if isinstance(item, torch.Tensor):
+                          raw_audio_items_for_processor.append(item.numpy().astype(np.float32))
+                      elif isinstance(item, (list, tuple)) and item and isinstance(item[0], (int, float)):
+                           raw_audio_items_for_processor.append(np.array(item, dtype=np.float32))
+                      elif isinstance(item, np.ndarray):
+                           raw_audio_items_for_processor.append(item.astype(np.float32))
+                      else:
+                           print(f"Warning: Skipping invalid item type in list of waveforms: {type(item)}")
+             else:
+                  raise TypeError(f"Unsupported format for list of audio data: first item type {type(first_item)}")
         else:
-            data_items = data
+            # If data format is none of the above
+            raise TypeError(f"Unsupported audio data format: {type(data)}")
 
-        new_audios = list[np.ndarray]()
-        for data_item in data_items:
-            audio, orig_sr = self._get_audio_with_sr(data_item)
-            if orig_sr is None:
-                new_audio = audio
-            else:
-                target_sr = self.target_sr
-                if target_sr is None:
-                    raise RuntimeError(
-                        "Audio resampling is not supported when "
-                        "`target_sr` is not provided")
-
-                new_audio = resample_audio(audio,
-                                           orig_sr=orig_sr,
-                                           target_sr=target_sr)
-
-            new_audios.append(new_audio)
-
-        return AudioProcessorItems(new_audios)
+        # If parsing resulted in raw items, pass them to AudioProcessorItems
+        if raw_audio_items_for_processor:
+             print(f"DEBUG: Parsed {len(raw_audio_items_for_processor)} raw audio items for AudioProcessorItems")
+             # Ensure AudioProcessorItems class is defined in parse.py
+             return AudioProcessorItems(raw_audio_items_for_processor)
+        else:
+            # This path shouldn't be reached if input validation is correct, but as a safeguard:
+            raise ValueError("Could not parse any audio items from the provided data.")
 
     def _parse_image_data(
         self,

@@ -406,7 +406,7 @@ class BaseMultiModalItemTracker(ABC, Generic[_T]):
             if model_type.startswith("llava"):
                 return self._cached_token_str(self._tokenizer,
                                               hf_config.image_token_index)
-            if model_type in ("chameleon", "deepseek_vl_v2", "internvl_chat",
+            if model_type in ("chameleon", "deepseek_vl_v2", "internvl_chat", "internvl_chat_audio",
                               "NVLM_D", "h2ovl_chat"):
                 return "<image>"
             if model_type == "mllama":
@@ -429,6 +429,8 @@ class BaseMultiModalItemTracker(ABC, Generic[_T]):
                         f"<|audio_bos|><|AUDIO|><|audio_eos|>")
             if model_type == "minicpmo":
                 return "(<audio>./</audio>)"
+            if model_type == "internvl_chat_audio":
+                return "<audio>"
             raise TypeError(f"Unknown model type: {model_type}")
         elif modality == "video":
             if model_type in ("qwen2_vl", "qwen2_5_vl"):
